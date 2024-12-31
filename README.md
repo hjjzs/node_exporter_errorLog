@@ -1,399 +1,473 @@
-# Node exporter
+## 背景
+要做一个扫描日志文件有多少个错误关键字的自定义监控。
 
-[![CircleCI](https://circleci.com/gh/prometheus/node_exporter/tree/master.svg?style=shield)][circleci]
-[![Buildkite status](https://badge.buildkite.com/94a0c1fb00b1f46883219c256efe9ce01d63b6505f3a942f9b.svg)](https://buildkite.com/prometheus/node-exporter)
-[![Docker Repository on Quay](https://quay.io/repository/prometheus/node-exporter/status)][quay]
-[![Docker Pulls](https://img.shields.io/docker/pulls/prom/node-exporter.svg?maxAge=604800)][hub]
-[![Go Report Card](https://goreportcard.com/badge/github.com/prometheus/node_exporter)][goreportcard]
+## 实现
+> node_exporter 版本： v1.8.2
+>
 
-Prometheus exporter for hardware and OS metrics exposed by \*NIX kernels, written
-in Go with pluggable metric collectors.
+> go: 1.22
+>
 
-The [Windows exporter](https://github.com/prometheus-community/windows_exporter) is recommended for Windows users.
-To expose NVIDIA GPU metrics, [prometheus-dcgm
-](https://github.com/NVIDIA/dcgm-exporter)
-can be used.
-
-## Installation and Usage
-
-If you are new to Prometheus and `node_exporter` there is a [simple step-by-step guide](https://prometheus.io/docs/guides/node-exporter/).
-
-The `node_exporter` listens on HTTP port 9100 by default. See the `--help` output for more options.
-
-### Ansible
-
-For automated installs with [Ansible](https://www.ansible.com/), there is the [Prometheus Community role](https://github.com/prometheus-community/ansible).
-
-### Docker
-
-The `node_exporter` is designed to monitor the host system. Deploying in containers requires
-extra care in order to avoid monitoring the container itself.
-
-For situations where containerized deployment is needed, some extra flags must be used to allow
-the `node_exporter` access to the host namespaces.
-
-Be aware that any non-root mount points you want to monitor will need to be bind-mounted
-into the container.
-
-If you start container for host monitoring, specify `path.rootfs` argument.
-This argument must match path in bind-mount of host root. The node\_exporter will use
-`path.rootfs` as prefix to access host filesystem.
-
-```bash
-docker run -d \
-  --net="host" \
-  --pid="host" \
-  -v "/:/host:ro,rslave" \
-  quay.io/prometheus/node-exporter:latest \
-  --path.rootfs=/host
+### 获取代码
+```shell
+git clone https://github.com/prometheus/node_exporter.git
+cd node_exporter/collector
+vim err_log.go
 ```
 
-For Docker compose, similar flag changes are needed.
+### 编码
+复制下面go代码到err_log.go文件中
 
-```yaml
----
-version: '3.8'
+```go
+//go:build (darwin || linux || openbsd) && !nomeminfo
 
-services:
-  node_exporter:
-    image: quay.io/prometheus/node-exporter:latest
-    container_name: node_exporter
-    command:
-      - '--path.rootfs=/host'
-    network_mode: host
-    pid: host
-    restart: unless-stopped
-    volumes:
-      - '/:/host:ro,rslave'
+package collector
+
+import (
+    "bufio"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log/slog"
+    "os"
+    "path/filepath"
+    "regexp"
+    "runtime"
+    "strings"
+    "sync"
+
+    "github.com/alecthomas/kingpin/v2"
+    "github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+    errLogSubsystem = "errlog"
+    chunkSize       = 1000
+)
+
+var (
+    errLogPath = kingpin.Flag("collector.errlog.path", "Path to the error log file").Default("/var/log/messages").String()
+    keyword    = kingpin.Flag("collector.errlog.keyword", "Regular expression to filter the error log").Default("error").String()
+    // 忽略大小写
+    ignoreCase = kingpin.Flag("collector.errlog.ignorecase", "Ignore case").Default("true").Bool()
+    // 全字匹配
+    fullMatch = kingpin.Flag("collector.errlog.fullmatch", "Full match").Default("true").Bool()
+    // 服务端口
+    port = kingpin.Flag("monitor.port", "monitor port for application").Default("1371").Int()
+
+    stateFile string
+)
+
+type errLogCollector struct {
+    logger       *slog.Logger
+    lastPosition int64
+    count        float64
+}
+
+type State struct {
+    Position int64   `json:"position"`
+    Count    float64 `json:"count"`
+}
+
+func init() {
+    registerCollector(errLogSubsystem, defaultEnabled, NewErrLogCollector)
+    // 保存日志读取位置，和错误行数到文件
+
+}
+
+// NewErrLogCollector returns a new Collector exposing memory stats.
+func NewErrLogCollector(logger *slog.Logger) (Collector, error) {
+    // 设置核心数,使用1/4的CPU核心数
+    runtime.GOMAXPROCS(runtime.NumCPU() / 4)
+
+    // 获取日志文件名,只取文件名，不包含路径
+    stateFile = "/var/lib/node_exporter/errlog_state_" + filepath.Base(*errLogPath) + ".json"
+
+    file, err := os.Open(*errLogPath)
+    if err != nil {
+        return nil, fmt.Errorf("无法打开日志文件: %v", err)
+    }
+    defer file.Close()
+
+    // 获取当前文件尾部位置
+    nowPos, err := file.Seek(0, io.SeekEnd)
+    if err != nil {
+        return nil, fmt.Errorf("无法获取文件位置: %v", err)
+    }
+
+    // 读取文件位置和错误行数
+    pos, count, err := readPositionAndCount()
+    if err != nil {
+        return nil, fmt.Errorf("无法读取文件位置和错误行数: %v", err)
+    }
+
+    // 如果文件尾部位置小于上次位置，说明文件被截断或日志被清空，从头开始读取
+    if nowPos < pos {
+        pos = 0
+        count = 0
+        savePositionAndCount(pos, count)
+        logger.Debug("errlog", "warn", "file truncated, reset position and count")
+    }
+
+    return &errLogCollector{
+        logger:       logger,
+        lastPosition: pos,
+        count:        count,
+    }, nil
+}
+
+// 保存日志读取位置，和错误行数到文件
+func savePositionAndCount(position int64, count float64) {
+    state := State{
+        Position: position,
+        Count:    count,
+    }
+
+    data, err := json.Marshal(state)
+    if err != nil {
+        return
+    }
+
+    // 确保目录存在
+    dir := filepath.Dir(stateFile)
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        return
+    }
+
+    // 写入临时文件，防止写入失败
+    tmpFile := stateFile + ".tmp"
+    if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+        return
+    }
+
+    // 原子性地重命名文件
+    os.Rename(tmpFile, stateFile)
+}
+
+// 从文件中读取日志读取位置，和错误行数
+func readPositionAndCount() (int64, float64, error) {
+    data, err := os.ReadFile(stateFile)
+    if err != nil {
+        if os.IsNotExist(err) {
+            return 0, 0, nil // 文件不存在时返回默认值
+        }
+        return 0, 0, err
+    }
+
+    var state State
+    if err := json.Unmarshal(data, &state); err != nil {
+        return 0, 0, err
+    }
+
+    return state.Position, state.Count, nil
+}
+
+type result struct {
+    count float64
+    err   error
+}
+
+// 从日志尾部读取新行，不统计以前的内容，重启后重新统计
+func (c *errLogCollector) readNewLines() (float64, error) {
+    file, err := os.Open(*errLogPath)
+    if err != nil {
+        return c.count, fmt.Errorf("无法打开日志文件: %v", err)
+    }
+    defer file.Close()
+
+    // 检查文件是否被截断
+    currentSize, err := file.Seek(0, io.SeekEnd)
+    if err != nil {
+        return c.count, err
+    }
+
+    // 如果文件大小小于上次位置，说明文件被截断或日志被清空，从头开始读取
+    if currentSize < c.lastPosition {
+        c.lastPosition = 0
+        c.count = 0
+        savePositionAndCount(c.lastPosition, c.count)
+        c.logger.Debug("errlog", "warn", "file truncated, reset position and count")
+    }
+
+    // 从上次位置开始读取
+    _, err = file.Seek(c.lastPosition, io.SeekStart)
+    if err != nil {
+        return c.count, err
+    }
+
+    /////
+    // 编译正则表达式
+    flags := ""
+    if *ignoreCase {
+        flags = "(?i)"
+    }
+    pattern := *keyword
+    if *fullMatch {
+        pattern = "\b" + pattern + "\b"
+    }
+    re, err := regexp.Compile(flags + pattern)
+    if err != nil {
+        c.logger.Error("invalid regex pattern", "source", "errlog", "error", err.Error())
+        return 0, err
+    }
+
+    // 创建一个缓冲通道来存储结果
+    resultChan := make(chan result)
+
+    // 创建一个工作组来跟踪所有 goroutine
+    var wg sync.WaitGroup
+
+    // 创建一个行缓冲切片
+    lines := make([]string, 0, chunkSize)
+
+    // 扫描文件并分块处理
+    scanner := bufio.NewScanner(file)
+
+    // 启动处理 goroutine
+    processChunk := func(chunk []string) {
+        defer wg.Done()
+        var localCount float64
+
+        for _, line := range chunk {
+            if re.MatchString(line) {
+                localCount++
+            }
+        }
+
+        resultChan <- result{count: localCount}
+    }
+
+    // 读取文件并分发任务
+    for scanner.Scan() {
+        lines = append(lines, scanner.Text())
+
+        // 当累积够一定数量的行时，启动一个新的 goroutine 处理
+        if len(lines) >= chunkSize {
+            wg.Add(1)
+            // 创建一个新的切片来存储当前块的内容
+            chunk := make([]string, len(lines))
+            copy(chunk, lines)
+            go processChunk(chunk)
+
+            // 清空切片，为下一块做准备
+            lines = lines[:0]
+        }
+    }
+
+    // 处理剩余的行
+    if len(lines) > 0 {
+        wg.Add(1)
+        go processChunk(lines)
+    }
+
+    // 在另一个 goroutine 中等待所有工作完成并关闭结果通道
+    go func() {
+        wg.Wait()
+        close(resultChan)
+    }()
+
+    // 收集所有结果
+    var totalCount float64
+    for r := range resultChan {
+        if r.err != nil {
+            c.logger.Error("processing chunk", "error", r.err.Error())
+            continue
+        }
+        totalCount += r.count
+    }
+
+    if err := scanner.Err(); err != nil {
+        c.logger.Error("errlog", "error", err.Error())
+        return 0, err
+    }
+
+    // 更新文件位置
+    c.lastPosition = currentSize
+
+    // 计算匹配行数,如果为空，文件没有变化
+    if totalCount == 0 {
+        return c.count, nil
+    }
+
+    c.count = c.count + totalCount
+
+    // 保存状态
+    savePositionAndCount(c.lastPosition, c.count)
+
+    return c.count, nil
+}
+
+// 检查服务端口是否存在，使用查看系统文件的方式
+// 如果使用命令检查，可能存在运行环境没有安装情况
+// 如果使用net库去尝试占用端口的检查方法，如果应用程序在node_exporter检查端口时重启，可能启动失败。
+func (c *errLogCollector) checkPort(logger *slog.Logger) float64 {
+    portHex := fmt.Sprintf("%04X", *port) // 转换为16进制
+
+    // 检查 TCP4
+    tcp4Data, err := os.ReadFile("/proc/net/tcp")
+    if err == nil {
+        // 按行分割
+        lines := strings.Split(string(tcp4Data), "\n")
+        for _, line := range lines[1:] { // 跳过标题行
+            fields := strings.Fields(line)
+            if len(fields) > 2 {
+                // local_address 格式为 "IP:PORT"
+                localAddr := strings.Split(fields[1], ":")
+                if len(localAddr) == 2 && localAddr[1] == portHex {
+                    logger.Debug("port check", "status", "in use (TCP4)", "port", *port)
+                    return 1
+                }
+            }
+        }
+    }
+
+    // 检查 TCP6
+    tcp6Data, err := os.ReadFile("/proc/net/tcp6")
+    if err == nil {
+        lines := strings.Split(string(tcp6Data), "\n")
+        for _, line := range lines[1:] {
+            fields := strings.Fields(line)
+            if len(fields) > 2 {
+                localAddr := strings.Split(fields[1], ":")
+                if len(localAddr) == 2 && localAddr[1] == portHex {
+                    logger.Debug("port check", "status", "in use (TCP6)", "port", *port)
+                    return 1
+                }
+            }
+        }
+    }
+
+    logger.Debug("port check", "status", "not in use", "port", *port)
+    return 0
+}
+
+// Update calls (*errLogCollector).getErrLog to get the platform specific
+func (c *errLogCollector) Update(ch chan<- prometheus.Metric) error {
+    name := "error_keyword_count"
+
+    var metricType = prometheus.GaugeValue
+
+    output, err := c.readNewLines()
+    if err != nil {
+        c.logger.Error("errlog", "error", err.Error())
+        return err
+    }
+
+    c.logger.Debug("errlog", "error_keyword_count from:", *errLogPath, "is:", output)
+    ch <- prometheus.MustNewConstMetric(
+        prometheus.NewDesc(
+            prometheus.BuildFQName(namespace, errLogSubsystem, name),
+            fmt.Sprintf("Number of errors matching pattern in %s", *errLogPath),
+            []string{"keyword", "logpath"},
+            nil,
+        ),
+        metricType, output,
+        *keyword, *errLogPath,
+    )
+
+    // 添加端口检查指标
+    portStatus := c.checkPort(c.logger)
+    ch <- prometheus.MustNewConstMetric(
+        prometheus.NewDesc(
+            prometheus.BuildFQName(namespace, errLogSubsystem, "port_status"),
+            fmt.Sprintf("Status of port %d (1: in use, 0: not in use)", *port),
+            []string{"port"},
+            nil,
+        ),
+        prometheus.GaugeValue,
+        portStatus,
+        fmt.Sprintf("%d", *port),
+    )
+
+    return nil
+}
+
 ```
 
-On some systems, the `timex` collector requires an additional Docker flag,
-`--cap-add=SYS_TIME`, in order to access the required syscalls.
-
-## Collectors
-
-There is varying support for collectors on each operating system. The tables
-below list all existing collectors and the supported systems.
-
-Collectors are enabled by providing a `--collector.<name>` flag.
-Collectors that are enabled by default can be disabled by providing a `--no-collector.<name>` flag.
-To enable only some specific collector(s), use `--collector.disable-defaults --collector.<name> ...`.
-
-### Include & Exclude flags
-
-A few collectors can be configured to include or exclude certain patterns using dedicated flags. The exclude flags are used to indicate "all except", while the include flags are used to say "none except". Note that these flags are mutually exclusive on collectors that support both.
-
-Example:
-
-```txt
---collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+### 编译
+```shell
+go mod tidy
+go build -o node_exporter node_exporter.go
 ```
 
-List:
+## 使用
++ --collector.errlog.path：指定错误日志文件的路径。默认值为 /var/log/messages。
++ --collector.errlog.keyword：用于过滤错误日志的正则表达式。默认值为 error。
++ --collector.errlog.ignorecase：忽略大小写。（默认开启）
++ --no-collector.errlog.ignorecase： 不忽略大小写。
++ --collector.errlog.fullmatch：进行全字匹配（只匹配单词）。（默认开启）
++ --no-collector.errlog.fullmatch：不进行全字匹配（包含关键字）。
++ --monitor.port=1371：监控端口是否存在。
 
-Collector | Scope | Include Flag | Exclude Flag
---- | --- | --- | ---
-arp | device | --collector.arp.device-include | --collector.arp.device-exclude
-cpu | bugs | --collector.cpu.info.bugs-include | N/A
-cpu | flags | --collector.cpu.info.flags-include | N/A
-diskstats | device | --collector.diskstats.device-include | --collector.diskstats.device-exclude
-ethtool | device | --collector.ethtool.device-include | --collector.ethtool.device-exclude
-ethtool | metrics | --collector.ethtool.metrics-include | N/A
-filesystem | fs-types | N/A | --collector.filesystem.fs-types-exclude
-filesystem | mount-points | N/A | --collector.filesystem.mount-points-exclude
-hwmon | chip | --collector.hwmon.chip-include | --collector.hwmon.chip-exclude
-hwmon | sensor | --collector.hwmon.sensor-include | --collector.hwmon.sensor-exclude
-interrupts | name | --collector.interrupts.name-include | --collector.interrupts.name-exclude
-netdev | device | --collector.netdev.device-include | --collector.netdev.device-exclude
-qdisk | device | --collector.qdisk.device-include | --collector.qdisk.device-exclude
-slabinfo | slab-names | --collector.slabinfo.slabs-include | --collector.slabinfo.slabs-exclude
-sysctl | all | --collector.sysctl.include | N/A
-systemd | unit | --collector.systemd.unit-include | --collector.systemd.unit-exclude
 
-### Enabled by default
 
-Name     | Description | OS
----------|-------------|----
-arp | Exposes ARP statistics from `/proc/net/arp`. | Linux
-bcache | Exposes bcache statistics from `/sys/fs/bcache/`. | Linux
-bonding | Exposes the number of configured and active slaves of Linux bonding interfaces. | Linux
-btrfs | Exposes btrfs statistics | Linux
-boottime | Exposes system boot time derived from the `kern.boottime` sysctl. | Darwin, Dragonfly, FreeBSD, NetBSD, OpenBSD, Solaris
-conntrack | Shows conntrack statistics (does nothing if no `/proc/sys/net/netfilter/` present). | Linux
-cpu | Exposes CPU statistics | Darwin, Dragonfly, FreeBSD, Linux, Solaris, OpenBSD
-cpufreq | Exposes CPU frequency statistics | Linux, Solaris
-diskstats | Exposes disk I/O statistics. | Darwin, Linux, OpenBSD
-dmi | Expose Desktop Management Interface (DMI) info from `/sys/class/dmi/id/` | Linux
-edac | Exposes error detection and correction statistics. | Linux
-entropy | Exposes available entropy. | Linux
-exec | Exposes execution statistics. | Dragonfly, FreeBSD
-fibrechannel | Exposes fibre channel information and statistics from `/sys/class/fc_host/`. | Linux
-filefd | Exposes file descriptor statistics from `/proc/sys/fs/file-nr`. | Linux
-filesystem | Exposes filesystem statistics, such as disk space used. | Darwin, Dragonfly, FreeBSD, Linux, OpenBSD
-hwmon | Expose hardware monitoring and sensor data from `/sys/class/hwmon/`. | Linux
-infiniband | Exposes network statistics specific to InfiniBand and Intel OmniPath configurations. | Linux
-ipvs | Exposes IPVS status from `/proc/net/ip_vs` and stats from `/proc/net/ip_vs_stats`. | Linux
-loadavg | Exposes load average. | Darwin, Dragonfly, FreeBSD, Linux, NetBSD, OpenBSD, Solaris
-mdadm | Exposes statistics about devices in `/proc/mdstat` (does nothing if no `/proc/mdstat` present). | Linux
-meminfo | Exposes memory statistics. | Darwin, Dragonfly, FreeBSD, Linux, OpenBSD
-netclass | Exposes network interface info from `/sys/class/net/` | Linux
-netdev | Exposes network interface statistics such as bytes transferred. | Darwin, Dragonfly, FreeBSD, Linux, OpenBSD
-netisr | Exposes netisr statistics | FreeBSD
-netstat | Exposes network statistics from `/proc/net/netstat`. This is the same information as `netstat -s`. | Linux
-nfs | Exposes NFS client statistics from `/proc/net/rpc/nfs`. This is the same information as `nfsstat -c`. | Linux
-nfsd | Exposes NFS kernel server statistics from `/proc/net/rpc/nfsd`. This is the same information as `nfsstat -s`. | Linux
-nvme | Exposes NVMe info from `/sys/class/nvme/` | Linux
-os | Expose OS release info from `/etc/os-release` or `/usr/lib/os-release` | _any_
-powersupplyclass | Exposes Power Supply statistics from `/sys/class/power_supply` | Linux
-pressure | Exposes pressure stall statistics from `/proc/pressure/`. | Linux (kernel 4.20+ and/or [CONFIG\_PSI](https://www.kernel.org/doc/html/latest/accounting/psi.html))
-rapl | Exposes various statistics from `/sys/class/powercap`. | Linux
-schedstat | Exposes task scheduler statistics from `/proc/schedstat`. | Linux
-selinux | Exposes SELinux statistics. | Linux
-sockstat | Exposes various statistics from `/proc/net/sockstat`. | Linux
-softnet | Exposes statistics from `/proc/net/softnet_stat`. | Linux
-stat | Exposes various statistics from `/proc/stat`. This includes boot time, forks and interrupts. | Linux
-tapestats | Exposes statistics from `/sys/class/scsi_tape`. | Linux
-textfile | Exposes statistics read from local disk. The `--collector.textfile.directory` flag must be set. | _any_
-thermal | Exposes thermal statistics like `pmset -g therm`. | Darwin
-thermal\_zone | Exposes thermal zone & cooling device statistics from `/sys/class/thermal`. | Linux
-time | Exposes the current system time. | _any_
-timex | Exposes selected adjtimex(2) system call stats. | Linux
-udp_queues | Exposes UDP total lengths of the rx_queue and tx_queue from `/proc/net/udp` and `/proc/net/udp6`. | Linux
-uname | Exposes system information as provided by the uname system call. | Darwin, FreeBSD, Linux, OpenBSD
-vmstat | Exposes statistics from `/proc/vmstat`. | Linux
-watchdog | Exposes statistics from `/sys/class/watchdog` | Linux
-xfs | Exposes XFS runtime statistics. | Linux (kernel 4.4+)
-zfs | Exposes [ZFS](http://open-zfs.org/) performance statistics. | FreeBSD, [Linux](http://zfsonlinux.org/), Solaris
-
-### Disabled by default
-
-`node_exporter` also implements a number of collectors that are disabled by default.  Reasons for this vary by
-collector, and may include:
-* High cardinality
-* Prolonged runtime that exceeds the Prometheus `scrape_interval` or `scrape_timeout`
-* Significant resource demands on the host
-
-You can enable additional collectors as desired by adding them to your
-init system's or service supervisor's startup configuration for
-`node_exporter` but caution is advised.  Enable at most one at a time,
-testing first on a non-production system, then by hand on a single
-production node.  When enabling additional collectors, you should
-carefully monitor the change by observing the `
-scrape_duration_seconds` metric to ensure that collection completes
-and does not time out.  In addition, monitor the
-`scrape_samples_post_metric_relabeling` metric to see the changes in
-cardinality.
-
-Name     | Description | OS
----------|-------------|----
-buddyinfo | Exposes statistics of memory fragments as reported by /proc/buddyinfo. | Linux
-cgroups | A summary of the number of active and enabled cgroups | Linux
-cpu\_vulnerabilities | Exposes CPU vulnerability information from sysfs. | Linux
-devstat | Exposes device statistics | Dragonfly, FreeBSD
-drm | Expose GPU metrics using sysfs / DRM, `amdgpu` is the only driver which exposes this information through DRM | Linux
-drbd | Exposes Distributed Replicated Block Device statistics (to version 8.4) | Linux
-ethtool | Exposes network interface information and network driver statistics equivalent to `ethtool`, `ethtool -S`, and `ethtool -i`. | Linux
-interrupts | Exposes detailed interrupts statistics. | Linux, OpenBSD
-ksmd | Exposes kernel and system statistics from `/sys/kernel/mm/ksm`. | Linux
-lnstat | Exposes stats from `/proc/net/stat/`. | Linux
-logind | Exposes session counts from [logind](http://www.freedesktop.org/wiki/Software/systemd/logind/). | Linux
-meminfo\_numa | Exposes memory statistics from `/sys/devices/system/node/node[0-9]*/meminfo`, `/sys/devices/system/node/node[0-9]*/numastat`. | Linux
-mountstats | Exposes filesystem statistics from `/proc/self/mountstats`. Exposes detailed NFS client statistics. | Linux
-network_route | Exposes the routing table as metrics | Linux
-perf | Exposes perf based metrics (Warning: Metrics are dependent on kernel configuration and settings). | Linux
-processes | Exposes aggregate process statistics from `/proc`. | Linux
-qdisc | Exposes [queuing discipline](https://en.wikipedia.org/wiki/Network_scheduler#Linux_kernel) statistics | Linux
-slabinfo | Exposes slab statistics from `/proc/slabinfo`. Note that permission of `/proc/slabinfo` is usually 0400, so set it appropriately. | Linux
-softirqs | Exposes detailed softirq statistics from `/proc/softirqs`. | Linux
-sysctl | Expose sysctl values from `/proc/sys`. Use `--collector.sysctl.include(-info)` to configure. | Linux
-systemd | Exposes service and system status from [systemd](http://www.freedesktop.org/wiki/Software/systemd/). | Linux
-tcpstat | Exposes TCP connection status information from `/proc/net/tcp` and `/proc/net/tcp6`. (Warning: the current version has potential performance issues in high load situations.) | Linux
-wifi | Exposes WiFi device and station statistics. | Linux
-xfrm | Exposes statistics from `/proc/net/xfrm_stat` | Linux
-zoneinfo | Exposes NUMA memory zone metrics. | Linux
-
-### Deprecated
-
-These collectors are deprecated and will be removed in the next major release.
-
-Name     | Description | OS
----------|-------------|----
-ntp | Exposes local NTP daemon health to check [time](./docs/TIME.md) | _any_
-runit | Exposes service status from [runit](http://smarden.org/runit/). | _any_
-supervisord | Exposes service status from [supervisord](http://supervisord.org/). | _any_
-
-### Perf Collector
-
-The `perf` collector may not work out of the box on some Linux systems due to kernel
-configuration and security settings. To allow access, set the following `sysctl`
-parameter:
-
-```
-sysctl -w kernel.perf_event_paranoid=X
+```shell
+./node_exporter \
+  --collector.errlog.path=/var/log/app1 \
+  --collector.errlog.keyword="error" \
+  --no-collector.errlog.ignorecase \
+  --monitor.port=1371
 ```
 
-- 2 allow only user-space measurements (default since Linux 4.6).
-- 1 allow both kernel and user measurements (default before Linux 4.6).
-- 0 allow access to CPU-specific data but not raw tracepoint samples.
-- -1 no restrictions.
+端口检查metrics样式：
 
-Depending on the configured value different metrics will be available, for most
-cases `0` will provide the most complete set. For more information see [`man 2
-perf_event_open`](http://man7.org/linux/man-pages/man2/perf_event_open.2.html).
-
-By default, the `perf` collector will only collect metrics of the CPUs that
-`node_exporter` is running on (ie
-[`runtime.NumCPU`](https://golang.org/pkg/runtime/#NumCPU). If this is
-insufficient (e.g. if you run `node_exporter` with its CPU affinity set to
-specific CPUs), you can specify a list of alternate CPUs by using the
-`--collector.perf.cpus` flag. For example, to collect metrics on CPUs 2-6, you
-would specify: `--collector.perf --collector.perf.cpus=2-6`. The CPU
-configuration is zero indexed and can also take a stride value; e.g.
-`--collector.perf --collector.perf.cpus=1-10:5` would collect on CPUs
-1, 5, and 10.
-
-The `perf` collector is also able to collect
-[tracepoint](https://www.kernel.org/doc/html/latest/core-api/tracepoint.html)
-counts when using the `--collector.perf.tracepoint` flag. Tracepoints can be
-found using [`perf list`](http://man7.org/linux/man-pages/man1/perf.1.html) or
-from debugfs. And example usage of this would be
-`--collector.perf.tracepoint="sched:sched_process_exec"`.
-
-### Sysctl Collector
-
-The `sysctl` collector can be enabled with `--collector.sysctl`. It supports exposing numeric sysctl values
-as metrics using the `--collector.sysctl.include` flag and string values as info metrics by using the
-`--collector.sysctl.include-info` flag. The flags can be repeated. For sysctl with multiple numeric values,
-an optional mapping can be given to expose each value as its own metric. Otherwise an `index` label is used
-to identify the different fields.
-
-#### Examples
-##### Numeric values
-###### Single values
-Using `--collector.sysctl.include=vm.user_reserve_kbytes`:
-`vm.user_reserve_kbytes = 131072` -> `node_sysctl_vm_user_reserve_kbytes 131072`
-
-###### Multiple values
-A sysctl can contain multiple values, for example:
-```
-net.ipv4.tcp_rmem = 4096	131072	6291456
-```
-Using `--collector.sysctl.include=net.ipv4.tcp_rmem` the collector will expose:
-```
-node_sysctl_net_ipv4_tcp_rmem{index="0"} 4096
-node_sysctl_net_ipv4_tcp_rmem{index="1"} 131072
-node_sysctl_net_ipv4_tcp_rmem{index="2"} 6291456
-```
-If the indexes have defined meaning like in this case, the values can be mapped to multiple metrics by appending the mapping to the --collector.sysctl.include flag:
-Using `--collector.sysctl.include=net.ipv4.tcp_rmem:min,default,max` the collector will expose:
-```
-node_sysctl_net_ipv4_tcp_rmem_min 4096
-node_sysctl_net_ipv4_tcp_rmem_default 131072
-node_sysctl_net_ipv4_tcp_rmem_max 6291456
+```shell
+# HELP node_errlog_port_status Status of port 80 (1: in use, 0: not in use)
+# TYPE node_errlog_port_status gauge
+node_errlog_port_status{port="80"} 0
 ```
 
-##### String values
-String values need to be exposed as info metric. The user selects them by using the `--collector.sysctl.include-info` flag.
-
-###### Single values
-`kernel.core_pattern = core` -> `node_sysctl_info{key="kernel.core_pattern_info", value="core"} 1`
-
-###### Multiple values
-Given the following sysctl:
-```
-kernel.seccomp.actions_avail = kill_process kill_thread trap errno trace log allow
-```
-Setting `--collector.sysctl.include-info=kernel.seccomp.actions_avail` will yield:
-```
-node_sysctl_info{key="kernel.seccomp.actions_avail", index="0", value="kill_process"} 1
-node_sysctl_info{key="kernel.seccomp.actions_avail", index="1", value="kill_thread"} 1
-...
+```shell
+# HELP node_errlog_port_status Status of port 22 (1: in use, 0: not in use)
+# TYPE node_errlog_port_status gauge
+node_errlog_port_status{port="22"} 1
 ```
 
-### Textfile Collector
+metrics 样式（错误关键字）
 
-The `textfile` collector is similar to the [Pushgateway](https://github.com/prometheus/pushgateway),
-in that it allows exporting of statistics from batch jobs. It can also be used
-to export static metrics, such as what role a machine has. The Pushgateway
-should be used for service-level metrics. The `textfile` module is for metrics
-that are tied to a machine.
+```shell
+curl -s http://localhost:9100/metrics | grep errlog
 
-To use it, set the `--collector.textfile.directory` flag on the `node_exporter` commandline. The
-collector will parse all files in that directory matching the glob `*.prom`
-using the [text
-format](http://prometheus.io/docs/instrumenting/exposition_formats/). **Note:** Timestamps are not supported.
-
-To atomically push completion time for a cron job:
-```
-echo my_batch_job_completion_time $(date +%s) > /path/to/directory/my_batch_job.prom.$$
-mv /path/to/directory/my_batch_job.prom.$$ /path/to/directory/my_batch_job.prom
+# HELP node_errlog_error_keyword_count Number of errors matching pattern in /var/log/app1
+# TYPE node_errlog_error_keyword_count gauge
+node_errlog_error_keyword_count{keyword="error",logpath="/var/log/app1"} 1
 ```
 
-To statically set roles for a machine using labels:
-```
-echo 'role{role="application_server"} 1' > /path/to/directory/role.prom.$$
-mv /path/to/directory/role.prom.$$ /path/to/directory/role.prom
-```
+测试用`/var/log/app1`文件内容如下：
 
-### Filtering enabled collectors
+![](https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/eYVOLwJG827Nqpz2/img/2ee5eca3-973b-4d3b-8b3b-1513c0ee9e0a.png)
 
-The `node_exporter` will expose all metrics from enabled collectors by default.  This is the recommended way to collect metrics to avoid errors when comparing metrics of different families.
+开启忽略大小写（改配置默认开启）
 
-For advanced use the `node_exporter` can be passed an optional list of collectors to filter metrics. The parameters `collect[]` and `exclude[]` can be used multiple times (but cannot be combined).  In Prometheus configuration you can use this syntax under the [scrape config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#<scrape_config>).
-
-Collect only `cpu` and `meminfo` collector metrics:
-```
-  params:
-    collect[]:
-      - cpu
-      - meminfo
+```shell
+./node_exporter \
+  --collector.errlog.path=/var/log/app1 \
+  --collector.errlog.keyword="error" \
 ```
 
-Collect all enabled collector metrics but exclude `netdev`:
-```
-  params:
-    exclude[]:
-      - netdev
-```
-
-This can be useful for having different Prometheus servers collect specific metrics from nodes.
-
-## Development building and running
-
-Prerequisites:
-
-* [Go compiler](https://golang.org/dl/)
-* RHEL/CentOS: `glibc-static` package.
-
-Building:
-
-    git clone https://github.com/prometheus/node_exporter.git
-    cd node_exporter
-    make build
-    ./node_exporter <flags>
-
-To see all available configuration flags:
-
-    ./node_exporter -h
-
-## Running tests
-
-    make test
-
-## TLS endpoint
-
-**EXPERIMENTAL**
-
-The exporter supports TLS via a new web configuration file.
-
-```console
-./node_exporter --web.config.file=web-config.yml
+```shell
+# HELP node_errlog_error_keyword_count Number of errors matching pattern in /var/log/app1
+# TYPE node_errlog_error_keyword_count gauge
+node_errlog_error_keyword_count{keyword="error",logpath="/var/log/app1"} 4
 ```
 
-See the [exporter-toolkit web-configuration](https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md) for more details.
+不进行全字匹配（只要包含关键字都将进入计算）
 
-[travis]: https://travis-ci.org/prometheus/node_exporter
-[hub]: https://hub.docker.com/r/prom/node-exporter/
-[circleci]: https://circleci.com/gh/prometheus/node_exporter
-[quay]: https://quay.io/repository/prometheus/node-exporter
-[goreportcard]: https://goreportcard.com/report/github.com/prometheus/node_exporter
+```shell
+./node_exporter \
+  --collector.errlog.path=/var/log/app1 \
+  --collector.errlog.keyword="error" \
+  --no-collector.errlog.fullmatch
+```
+
+```shell
+# HELP node_errlog_error_keyword_count Number of errors matching pattern in /var/log/app1
+# TYPE node_errlog_error_keyword_count gauge
+node_errlog_error_keyword_count{keyword="error",logpath="/var/log/app1"} 5
+```
+
+## 缓存讲解
+该计算器会记录日志读取的位置，并将数据持久化保存在`/var/lib/node_export/`目录下。文件命名如下：
+
+![](https://alidocs.oss-cn-zhangjiakou.aliyuncs.com/res/eYVOLwJG827Nqpz2/img/b884a438-2cf2-49aa-925c-0fe1e8d1b392.png)
+
